@@ -19,42 +19,111 @@ import folium
 from folium import plugins
 
 class RoadSkeletonizer:
+    """
+    Road network skeletonizer that extracts and simplifies road centerlines from OpenStreetMap data.
+    
+    This class follows scikit-learn's API pattern:
+    - __init__(): Sets parameters only (no computation)
+    - fit(polygon): Runs the full pipeline on a given polygon
+    
+    Example usage:
+        >>> skeletonizer = RoadSkeletonizer(
+        ...     buffer_size=100,
+        ...     road_tags={"highway": ["motorway", "trunk", "primary"]},
+        ...     verbose=True
+        ... )
+        >>> skeletonizer.fit(my_polygon)
+        >>> # Access results
+        >>> G = skeletonizer.G  # NetworkX graph
+        >>> nodes = skeletonizer.nodes  # GeoDataFrame of nodes
+        >>> edges = skeletonizer.segments  # GeoDataFrame of edges
+    """
     def __init__(
             self, 
-            polygon, 
             buffer_size = 100, 
             road_tags = {"highway": ["motorway","motorway_link","trunk","trunk_link"]},
+            simplify_min_length = 300,
+            simplify_merge_distance = 250,
             verbose=False,
             timing: bool = False
         ):
         """
-        Given a cbsa code and a buffer size, create a skeleton
-        of the highways and roads within the CBSA area.
+        Initialize a RoadSkeletonizer with parameters.
+        
+        Following scikit-learn API pattern: __init__ only sets parameters,
+        use fit() to run the pipeline.
 
         It is possible to edit the type of roads to include from OSM.
-        Defult is motorway, motorway_link, trunk, trunk_link from highway tag.
+        Default is motorway, motorway_link, trunk, trunk_link from highway tag.
 
         Args:
-            cbsac_code (str): The CBSA code to query.
             buffer_size (int, optional): The buffer size in meters. Defaults to 100.
             road_tags (dict, optional): The OSM road tags to include. Defaults to {"highway": ["motorway","motorway_link","trunk","trunk_link"]}.
+            simplify_min_length (float, optional): Length threshold for initial pruning/chain building in graph simplification. Defaults to 300.
+            simplify_merge_distance (float, optional): Length threshold for final merging heuristics in graph simplification. Defaults to 250.
+            verbose (bool, optional): Enable verbose output. Defaults to False.
+            timing (bool, optional): Enable timing output. Defaults to False.
         """
-
-        self.verbose = verbose
-        self.timing = timing
-        self.polygon = polygon   
-        self.bbox = polygon.bounds  
+        # Store parameters
         self.buffer_size = buffer_size
         self.road_tags = road_tags
-
-        # Fetch highways first; buffered shape depends on them
-        self.highways = self.get_highways()
+        self.simplify_min_length = simplify_min_length
+        self.simplify_merge_distance = simplify_merge_distance
+        self.verbose = verbose
+        self.timing = timing
+        
+        # Initialize attributes that will be set by fit()
+        self.polygon = None
+        self.bbox = None
+        self.roads = None
+        self.buffered_shape = None
+        self.linestring_skeleton = None
+        self.G = None
+        self.nodes = None
+        self.segments = None
+        self.error_message = None
+        
+    def fit(self, polygon):
+        """
+        Run the full road skeletonization pipeline on the given polygon.
+        
+        This method:
+        1. Fetches highways from OSM
+        2. Creates buffered shape
+        3. Generates skeleton linestrings
+        4. Builds graph from skeleton
+        5. Simplifies the graph
+        
+        Args:
+            polygon: The polygon boundary to analyze.
+            
+        Returns:
+            self: Returns self for method chaining (sklearn pattern).
+        """
+        if self.verbose:
+            print("=" * 60)
+            print("Starting RoadSkeletonizer pipeline")
+            print("=" * 60)
+        
+        t_total = time.perf_counter()
+        
+        # Set polygon and bbox
+        self.polygon = polygon
+        self.bbox = polygon.bounds
+        
+        # Run pipeline steps
+        self.roads = self.get_roads()
         self.buffered_shape = self.get_buffered_shape()
-
         self.linestring_skeleton = self.create_polygon_skeleton()
         self.G, self.nodes, self.segments = self.get_graph_from_polygon_skeleton()
-        self.simplify_graph_skeleton(min_length=200, merge_distance=100)
-        self.error_message = None
+        self.simplify_graph_skeleton(min_length=self.simplify_min_length, merge_distance=self.simplify_merge_distance)
+        
+        if self.timing or self.verbose:
+            print("=" * 60)
+            print(f"Total pipeline time: {time.perf_counter()-t_total:.2f}s")
+            print("=" * 60)
+        
+        return self
 
     
     def get_roads(self):
@@ -110,11 +179,11 @@ class RoadSkeletonizer:
         """
         if self.verbose:
             print("Creating buffered shape with buffer size:", self.buffer_size)
-        if len(self.highways.index) == 0:
+        if len(self.roads.index) == 0:
             buffered_shape = Polygon()
         else:
             # unioning a buffered polygon so that every lane merges
-            buffered_shape = self.highways.to_crs(epsg=3857).buffer(self.buffer_size).union_all()
+            buffered_shape = self.roads.to_crs(epsg=3857).buffer(self.buffer_size).union_all()
         return buffered_shape
     
     def create_polygon_skeleton(self):
@@ -196,71 +265,90 @@ class RoadSkeletonizer:
 
         return G, nodes, segments
     
-    def simplify_graph_skeleton(self, min_length=300, merge_distance=200):
-        """Simplify the highway skeleton graph in several stages.
-
-        Steps:
-        1. Collapse all degree-2 nodes (merge their adjacent edges into a single LineString).
-        2. Iteratively remove dangling edges shorter than min_length.
-        3. Merge consecutive short edges (< min_length) by building linear chains between junctions/endpoints.
-        4. Merge remaining short edges (< merge_distance) depending on endpoint degree patterns, including
-           creating a new midpoint node when both endpoints are high-degree (>2).
-
-        Args:
-            min_length (float): Length threshold (in projected units) for initial pruning/chain building.
-            merge_distance (float): Length threshold for final merging heuristics.
+    def collapse_degree2_nodes(self):
+        """Collapse all degree-2 nodes by merging their adjacent edges into single LineStrings.
+        
+        This method finds connected components of degree-2 nodes and merges them into single edges,
+        creating a cleaner graph structure.
+        
+        Returns:
+            int: Number of components that were merged.
         """
         if self.G is None:
             raise ValueError("No graph created yet.")
-        t_total_start = time.perf_counter()
+        
         if self.verbose:
-            print("Starting graph simplification with", self.G.number_of_nodes(), "nodes and", self.G.number_of_edges(), "edges.")
             print("Remove all degree-2 nodes")
+        
         t1 = time.perf_counter()
         deg2_nodes = [n for n in self.G.nodes() if self.G.degree(n) == 2]        
         subG = self.G.subgraph(deg2_nodes).copy()
+        
         # get connected components
         conn_comp = nx.connected_components(subG)
-        chains = []
         merged_components = 0
+        
         for comp in conn_comp:
             comp = list(comp)
             if len(comp) < 3:
                 continue  # skip short components
+            
             if self.verbose:
                 print("  Processing component:", comp)
+            
             # find endpoints in the full graph
             endpoints = [n for n in comp if subG.degree(n) != 2]
             if self.verbose:
                 print("    Endpoints in full graph:", endpoints)
                 print("Degrees:", [subG.degree(n) for n in endpoints])
+            
             u = [k for k in self.G.neighbors(endpoints[0]) if k not in comp][0]
             v = [k for k in self.G.neighbors(endpoints[-1]) if k not in comp][0]
+            
             # get geometries along the full chain
             chain = [u] + nx.shortest_path(subG, source=endpoints[0], target=endpoints[-1]) + [v]
-            chains.append(chain)
             geoms = []
-            for prev,next in zip(chain[:-1], chain[1:]):
+            for prev, next in zip(chain[:-1], chain[1:]):
                 geom = self.G.get_edge_data(prev, next)[0]['geometry']
                 geoms.append(geom)
+            
             # Robust merge of a chain into a single LineString
             merged_geom = linemerge(unary_union(geoms))
             if merged_geom.geom_type == 'MultiLineString':
                 merged_geom = LineString([pt for line in merged_geom.geoms for pt in line.coords])
+            
             # remove intermediate nodes and edges
             for n in comp:
                 self.G.remove_node(n)
+            
             # add new edge
             self.G.add_edge(u, v, geometry=merged_geom)
             merged_components += 1
+        
         if self.timing or self.verbose:
             print(f"Collapsed degree-2 components: {merged_components} in {time.perf_counter()-t1:.3f}s")
+        
+        return merged_components
 
+    def remove_dangling_edges(self, min_length=300):
+        """Iteratively remove dangling edges (degree-1 nodes) shorter than min_length.
+        
+        Args:
+            min_length (float): Length threshold for removing dangling edges.
+            
+        Returns:
+            int: Number of dangling edges removed.
+        """
+        if self.G is None:
+            raise ValueError("No graph created yet.")
+        
         if self.verbose:
             print("Remove dangling edges shorter than min_length")
+        
         t2 = time.perf_counter()
         removed_dangling = 0
         dangling = True
+        
         while dangling:
             dangling = False
             deg1_nodes = [n for n in self.G.nodes() if self.G.degree(n) == 1]
@@ -279,17 +367,36 @@ class RoadSkeletonizer:
                         self.G.remove_node(n)
                         dangling = True
                         removed_dangling += 1
+        
         if self.timing or self.verbose:
             print(f"Removed dangling short edges: {removed_dangling} in {time.perf_counter()-t2:.3f}s")
+        
+        return removed_dangling
 
+    def merge_short_edge_chains(self, min_length=300):
+        """Merge consecutive short edges (< min_length) by building linear chains.
+        
+        This method forms chains of short edges between junctions/endpoints and merges them
+        into single edges.
+        
+        Args:
+            min_length (float): Length threshold for identifying short edges.
+            
+        Returns:
+            int: Number of intermediate nodes removed.
+        """
+        if self.G is None:
+            raise ValueError("No graph created yet.")
+        
         if self.verbose:
             print("Merge consecutive edges shorter than min_length by forming chains")
+        
         t3 = time.perf_counter()
-
+        
         # get subgraph of edges smaller than min_length
         small_edges = [(u, v, 0) for u, v, k in self.G.edges(data=True) if k['geometry'].length < min_length]
         subG = self.G.edge_subgraph(small_edges).copy()
-
+        
         # create chains in this subgraph
         chains = []
         visited = set()
@@ -338,9 +445,10 @@ class RoadSkeletonizer:
                 
                 if len(chain) > 2:
                     chains.append(chain)
+        
         if self.timing or self.verbose:
             print(f"Formed {len(chains)} chains in {time.perf_counter()-t3:.3f}s")
-
+        
         # process chains that have been found
         t3b = time.perf_counter()
         removed_in_chains = 0
@@ -351,26 +459,49 @@ class RoadSkeletonizer:
             for i in range(len(chain) - 1):
                 edge_data = self.G.get_edge_data(chain[i], chain[i + 1])[0]
                 geoms.append(edge_data['geometry'])
-
+            
             # Robust merge of a chain into a single LineString
             merged_geom = linemerge(unary_union(geoms))
             if merged_geom.geom_type == 'MultiLineString':
                 merged_geom = LineString([pt for line in merged_geom.geoms for pt in line.coords])
+            
             # remove intermediate nodes and edges
             for i in range(1, len(chain) - 1):
                 self.G.remove_node(chain[i])
                 removed_in_chains += 1
+            
             # add new edge
             self.G.add_edge(u, v, geometry=merged_geom)
+        
         if self.timing or self.verbose:
             print(f"Merged chains and removed {removed_in_chains} intermediate nodes in {time.perf_counter()-t3b:.3f}s")
+        
+        return removed_in_chains
 
-        # list edges shorter than merge_distance
+    def merge_short_edges(self, merge_distance=200):
+        """Merge remaining short edges (< merge_distance) based on endpoint degree patterns.
+        
+        Handles four cases:
+        - Both endpoints degree 2: merge with shorter adjacent edge
+        - One endpoint degree 2: merge with that endpoint's other edge
+        - Both endpoints degree >2: create merged node at geometric center
+        
+        Args:
+            merge_distance (float): Length threshold for short edges.
+            
+        Returns:
+            int: Number of merge operations performed.
+        """
+        if self.G is None:
+            raise ValueError("No graph created yet.")
+        
         if self.verbose:
             print("Process remaining short edges (< merge_distance)")
+        
         t4 = time.perf_counter()
         ops_short_edges = 0
         short_edges = [(u, v) for u, v, k in self.G.edges(data=True) if k['geometry'].length < merge_distance]
+        
         for u, v in short_edges:
             # Skip if nodes were already removed by previous operations
             if u not in self.G.nodes() or v not in self.G.nodes():
@@ -380,6 +511,7 @@ class RoadSkeletonizer:
             
             if self.verbose:
                 print("  Edge", u, v, "Degrees", self.G.degree(u), self.G.degree(v))
+            
             deg_u = self.G.degree(u)
             deg_v = self.G.degree(v)
             geom_edge = self.G.get_edge_data(u, v, 0)['geometry']
@@ -467,8 +599,209 @@ class RoadSkeletonizer:
                 self.G.remove_node(u)
                 self.G.remove_node(v)
                 ops_short_edges += 1
+        
         if self.timing or self.verbose:
             print(f"Processed remaining short edges: {ops_short_edges} operations in {time.perf_counter()-t4:.3f}s")
+        
+        return ops_short_edges
+    
+    def merge_nearby_nodes(self, merge_distance=200):
+        """Merge nodes that are geometrically close to each other into single nodes.
+        
+        This method identifies all pairs of nodes that are within merge_distance of each other,
+        finds connected components of these node pairs, and collapses each component into a 
+        single node at the geometric center. All edges from the removed nodes are redirected 
+        to the new merged node with adjusted geometries.
+        
+        Uses an R-tree spatial index for efficient nearest neighbor queries.
+        
+        Args:
+            merge_distance (float): Maximum distance (in projected units) between nodes to be merged.
+            
+        Returns:
+            int: Number of node clusters that were merged.
+        """
+        if self.G is None:
+            raise ValueError("No graph created yet.")
+        
+        if self.verbose:
+            print(f"Merging nearby nodes within {merge_distance} units")
+        
+        t_start = time.perf_counter()
+        
+        # Step 1: Build R-tree spatial index for efficient nearest neighbor queries
+        nodes_list = list(self.G.nodes())
+        node_positions = {n: (self.G.nodes[n]['x'], self.G.nodes[n]['y']) for n in nodes_list}
+        
+        if self.verbose:
+            print(f"  Building R-tree spatial index for {len(nodes_list)} nodes...")
+        
+        t_rtree = time.perf_counter()
+        
+        # Create nodes GeoDataFrame for spatial indexing
+        node_geoms = [Point(pos) for pos in node_positions.values()]
+        nodes_gdf = gpd.GeoDataFrame(
+            {'node_id': nodes_list, 'geometry': node_geoms},
+            crs=3857
+        )
+        
+        # GeoDataFrame automatically creates a spatial index (R-tree) when needed
+        if self.timing or self.verbose:
+            print(f"  R-tree built in {time.perf_counter()-t_rtree:.3f}s")
+        
+        # Find all pairs of nodes within merge_distance using R-tree
+        t_query = time.perf_counter()
+        close_pairs = []
+        processed_pairs = set()  # Avoid duplicate pairs
+        
+        for idx, node in enumerate(nodes_list):
+            node_geom = node_geoms[idx]
+            
+            # Use spatial index to find candidates within buffer distance
+            # Create a buffer around the point
+            buffer_geom = node_geom.buffer(merge_distance)
+            
+            # Query spatial index for nearby nodes
+            possible_matches_idx = list(nodes_gdf.sindex.query(buffer_geom, predicate='intersects'))
+            
+            # Check actual distances for candidates
+            for match_idx in possible_matches_idx:
+                neighbor_node = nodes_list[match_idx]
+                
+                # Skip self and already processed pairs
+                if neighbor_node == node:
+                    continue
+                    
+                pair = tuple(sorted([node, neighbor_node]))
+                if pair in processed_pairs:
+                    continue
+                
+                # Calculate exact distance
+                pos_u = node_positions[node]
+                pos_v = node_positions[neighbor_node]
+                dist = ((pos_u[0] - pos_v[0])**2 + (pos_u[1] - pos_v[1])**2)**0.5
+                
+                if dist < merge_distance:
+                    close_pairs.append(pair)
+                    processed_pairs.add(pair)
+        
+        if self.timing or self.verbose:
+            print(f"  Found {len(close_pairs)} node pairs within merge distance in {time.perf_counter()-t_query:.3f}s")
+        
+        # Step 2: Build a graph of close node pairs and find connected components
+        close_graph = nx.Graph()
+        close_graph.add_nodes_from(nodes_list)
+        close_graph.add_edges_from(close_pairs)
+        
+        # Get connected components (clusters of nearby nodes)
+        components = [comp for comp in nx.connected_components(close_graph) if len(comp) > 1]
+        
+        if self.verbose:
+            print(f"  Found {len(components)} connected components to merge")
+        
+        # Step 3: Process each component - merge into a single node
+        merged_clusters = 0
+        for comp in components:
+            comp_list = list(comp)
+            
+            if self.verbose:
+                print(f"    Processing cluster of {len(comp_list)} nodes: {comp_list[:5]}{'...' if len(comp_list) > 5 else ''}")
+            
+            # Calculate geometric center of all nodes in component
+            positions = [node_positions[n] for n in comp_list]
+            center_x = sum(pos[0] for pos in positions) / len(positions)
+            center_y = sum(pos[1] for pos in positions) / len(positions)
+            
+            # Create new merged node ID
+            new_node_id = f"merged_cluster_{merged_clusters}"
+            self.G.add_node(new_node_id, x=center_x, y=center_y, geometry=Point(center_x, center_y))
+            
+            # Collect all edges from nodes in this component
+            edges_to_redirect = []
+            for node in comp_list:
+                for neighbor in list(self.G.neighbors(node)):
+                    if neighbor not in comp_list:  # Only external edges
+                        edge_data = self.G.get_edge_data(node, neighbor)
+                        if edge_data:
+                            geom_old = edge_data[0]['geometry']
+                            edges_to_redirect.append((node, neighbor, geom_old))
+            
+            # Redirect all external edges to the new merged node
+            for old_node, external_neighbor, geom_old in edges_to_redirect:
+                pos_old = node_positions[old_node]
+                coords_old = list(geom_old.coords)
+                
+                # Adjust geometry to connect to new center
+                if coords_old[0] == pos_old:
+                    new_coords = [(center_x, center_y)] + coords_old[1:]
+                elif coords_old[-1] == pos_old:
+                    new_coords = coords_old[:-1] + [(center_x, center_y)]
+                else:
+                    # Fallback: replace closest endpoint
+                    dist_to_start = ((coords_old[0][0] - pos_old[0])**2 + (coords_old[0][1] - pos_old[1])**2)**0.5
+                    dist_to_end = ((coords_old[-1][0] - pos_old[0])**2 + (coords_old[-1][1] - pos_old[1])**2)**0.5
+                    if dist_to_start < dist_to_end:
+                        new_coords = [(center_x, center_y)] + coords_old[1:]
+                    else:
+                        new_coords = coords_old[:-1] + [(center_x, center_y)]
+                
+                new_geom = LineString(new_coords)
+                
+                # Add edge between merged node and external neighbor
+                # Check if edge already exists (multiple nodes in cluster connected to same external node)
+                if self.G.has_edge(new_node_id, external_neighbor):
+                    # Edge already exists, skip or you could merge geometries if desired
+                    continue
+                else:
+                    self.G.add_edge(new_node_id, external_neighbor, geometry=new_geom, color="cyan")
+            
+            # Remove all nodes in the component
+            for node in comp_list:
+                self.G.remove_node(node)
+            
+            merged_clusters += 1
+        
+        if self.timing or self.verbose:
+            print(f"Merged {merged_clusters} node clusters in {time.perf_counter()-t_start:.3f}s")
+        
+        return merged_clusters
+
+    def simplify_graph_skeleton(self, min_length=300, merge_distance=200):
+        """Simplify the highway skeleton graph through multiple stages.
+
+        This method applies a sequence of simplification steps to the graph:
+        1. Collapse degree-2 nodes
+        2. Remove dangling edges
+        3. Merge short edge chains
+        4. Merge remaining short edges
+
+        Args:
+            min_length (float): Length threshold (in projected units) for initial pruning/chain building. Defaults to 300.
+            merge_distance (float): Length threshold for final merging heuristics. Defaults to 200.
+        """
+        if self.G is None:
+            raise ValueError("No graph created yet.")
+        
+        t_total_start = time.perf_counter()
+        
+        if self.verbose:
+            print("Starting graph simplification with", self.G.number_of_nodes(), "nodes and", self.G.number_of_edges(), "edges.")
+        
+        # Step 1: Collapse degree-2 nodes
+        self.collapse_degree2_nodes()
+        
+        # Step 2: Remove dangling edges
+        self.remove_dangling_edges(min_length)
+        
+        # Step 3: Merge short edge chains
+        self.merge_short_edge_chains(min_length)
+        
+        # Step 4: Collapse degree-2 nodes again
+        self.collapse_degree2_nodes()
+
+        # Step 5: Merge remaining short edges
+        self.merge_nearby_nodes(merge_distance)
+        
         if self.timing or self.verbose:
             print(f"Total simplify time: {time.perf_counter()-t_total_start:.3f}s")
 
@@ -509,7 +842,7 @@ class RoadSkeletonizer:
         """Plot the polygon, buffered shape, highways, and simplified graph using matplotlib."""
         fig, ax = plt.subplots(figsize=(15, 15))
         if plot_highways:
-            self.highways.to_crs(epsg=3857).plot(ax=ax, color='black', linewidth=0.5, zorder=30)
+            self.roads.to_crs(epsg=3857).plot(ax=ax, color='black', linewidth=0.5, zorder=30)
         if plot_buffered_shape:
             gpd.GeoSeries(self.buffered_shape, crs=3857).plot(ax=ax,zorder=20,alpha=0.2,color="black")
 
@@ -541,7 +874,7 @@ class RoadSkeletonizer:
         m = folium.Map(location=center, zoom_start=12, tiles='CartoDB positron')
         
         if plot_highways:
-            highways_4326 = self.highways.to_crs(epsg=4326)
+            highways_4326 = self.roads.to_crs(epsg=4326)
             folium.GeoJson(
             highways_4326,
             style_function=lambda x: {'color': 'black', 'weight': 1, 'opacity': 0.7}
@@ -582,5 +915,8 @@ class RoadSkeletonizer:
                 polygon_gdf,
                 style_function=lambda x: {'fillColor': 'none', 'color': 'blue', 'weight': 2, 'fillOpacity': 0}
             ).add_to(m)
+
+        # add distance scale
+        folium.plugins.MeasureControl().add_to(m)
         
         return m
