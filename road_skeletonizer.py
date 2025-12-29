@@ -772,8 +772,8 @@ class RoadSkeletonizer:
         This method applies a sequence of simplification steps to the graph:
         1. Collapse degree-2 nodes
         2. Remove dangling edges
-        3. Merge short edge chains
-        4. Merge remaining short edges
+        3. Collapse degree-2 nodes again
+        4. Merge nearby nodes
 
         Args:
             min_length (float): Length threshold (in projected units) for initial pruning/chain building. Defaults to 300.
@@ -793,13 +793,10 @@ class RoadSkeletonizer:
         # Step 2: Remove dangling edges
         self.remove_dangling_edges(min_length)
         
-        # Step 3: Merge short edge chains
-        self.merge_short_edge_chains(min_length)
-        
-        # Step 4: Collapse degree-2 nodes again
+        # Step 3: Collapse degree-2 nodes again
         self.collapse_degree2_nodes()
 
-        # Step 5: Merge remaining short edges
+        # Step 4: Merge nearby nodes
         self.merge_nearby_nodes(merge_distance)
         
         if self.timing or self.verbose:
