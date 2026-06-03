@@ -144,7 +144,8 @@ class RoadSkeletonizer:
             )
             if self.timing or self.verbose:
                 print(f"OSM query (full tags) took {time.perf_counter()-t_attempt:.3f}s; features={len(roads)}")
-        except:
+        except Exception as e1:
+            print(f"OSM query (full tags) failed: {e1}")
             try:
                 t_attempt = time.perf_counter()
                 roads = ox.features_from_bbox(
@@ -154,7 +155,8 @@ class RoadSkeletonizer:
                 self.error_message = "Error fetching highways with all tags. Fetched without trunk and trunk_link."
                 if self.verbose:
                     print(f"OSM query (motorway+link) took {time.perf_counter()-t_attempt:.3f}s; features={len(roads)}")
-            except:
+            except Exception as e2:
+                print(f"OSM query (motorway+link) failed: {e2}")
                 try:
                     t_attempt = time.perf_counter()
                     roads = ox.features_from_bbox(
@@ -164,11 +166,10 @@ class RoadSkeletonizer:
                     self.error_message = "Error fetching highways with all tags. Fetched only motorway."
                     if self.verbose:
                         print(f"OSM query (motorway only) took {time.perf_counter()-t_attempt:.3f}s; features={len(roads)}")
-                except:
+                except Exception as e3:
+                    print(f"OSM query (motorway only) failed: {e3}")
                     roads = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
                     self.error_message = "Error fetching highways. Returning empty GeoDataFrame."
-                    if self.verbose:
-                        print("OSM query failed across attempts; returning empty GeoDataFrame")
             
         return roads
     
@@ -193,25 +194,36 @@ class RoadSkeletonizer:
         """
         if self.verbose:
             print("Creating polygon skeleton from buffered shape")
-        # check if the buffered shape is empty
-        if self.buffered_shape.area == 0:
-            linestring_skeleton = None
-        # create a skeleton of the buffered shape
-        try:
-            c = Centerline(self.buffered_shape,interpolation_distance=20)
-            linestring_skeleton = MultiLineString([g for g in c.geometry.geoms])
 
-        except:
-            self.error_message = "Error creating skeleton. Returning None."
-            linestring_skeleton = None
-        
-        # converting to a list of LineStrings
-        if type(linestring_skeleton) == MultiLineString:
-            linestring_skeleton = [l for l in linestring_skeleton.geoms]
-        elif type(linestring_skeleton) == LineString:
-            linestring_skeleton = [linestring_skeleton]
-        
-        return linestring_skeleton
+        if self.buffered_shape.is_empty or self.buffered_shape.area == 0:
+            return None
+
+        # Centerline requires a single Polygon; if the union produced a
+        # MultiPolygon (e.g. disconnected road clusters) process each part.
+        shape = self.buffered_shape
+        if shape.geom_type == "MultiPolygon":
+            parts = list(shape.geoms)
+        else:
+            parts = [shape]
+
+        all_lines = []
+        for part in parts:
+            try:
+                c = Centerline(part, interpolation_distance=20)
+                # centerline >=1.0 inherits from MultiLineString (use c.geoms);
+                # older versions store it in c.geometry.geoms.
+                raw = c if hasattr(c, "geoms") else c.geometry
+                all_lines.extend(
+                    g for g in raw.geoms if g.geom_type == "LineString"
+                )
+            except Exception as e:
+                self.error_message = f"Centerline failed on part: {e}"
+                print(f"  Warning: {self.error_message}")
+
+        if not all_lines:
+            return None
+
+        return all_lines
     
     def get_graph_from_polygon_skeleton(self):
         """Convert the skeleton LineStrings into an undirected NetworkX graph via osmnx.
@@ -225,6 +237,9 @@ class RoadSkeletonizer:
         """
         if self.verbose:
             print("Creating graph from polygon skeleton")
+
+        if not self.linestring_skeleton:
+            raise ValueError(f"No skeleton linestrings available. error_message='{self.error_message}'")
 
         # Segments GeoDataFrame
         segments = gpd.GeoDataFrame(geometry=list(self.linestring_skeleton), crs=3857)
@@ -300,7 +315,7 @@ class RoadSkeletonizer:
             endpoints = [n for n in comp if subG.degree(n) != 2]
             if self.verbose:
                 print("    Endpoints in full graph:", endpoints)
-                print("Degrees:", [subG.degree(n) for n in endpoints])
+                print("    Degrees:", [subG.degree(n) for n in endpoints])
             
             u = [k for k in self.G.neighbors(endpoints[0]) if k not in comp][0]
             v = [k for k in self.G.neighbors(endpoints[-1]) if k not in comp][0]
