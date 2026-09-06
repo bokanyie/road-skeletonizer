@@ -110,6 +110,7 @@ class RoadSkeletonizer:
         # Set polygon and bbox
         self.polygon = polygon
         self.bbox = polygon.bounds
+        self.error_message = None
         
         # Run pipeline steps
         self.roads = self.get_roads()
@@ -171,7 +172,27 @@ class RoadSkeletonizer:
                     if self.verbose:
                         print("OSM query failed across attempts; returning empty GeoDataFrame")
             
+        if not roads.empty:
+            polygon_geometry = gpd.GeoSeries([self.polygon], crs="EPSG:4326")
+            if roads.crs is not None:
+                polygon_geometry = polygon_geometry.to_crs(roads.crs)
+            roads = roads[
+                roads.geometry.notna()
+                & roads.geometry.intersects(polygon_geometry.iloc[0])
+            ].copy()
+            roads.geometry = roads.geometry.intersection(polygon_geometry.iloc[0])
+            roads = roads[roads.geometry.notna() & ~roads.geometry.is_empty].copy()
+
         return roads
+
+    def _get_edge_geometry(self, u, v, key=None):
+        """Return an edge geometry without assuming a particular multigraph key."""
+        edge_data = self.G.get_edge_data(u, v)
+        if not edge_data:
+            raise KeyError(f"No edge exists between {u!r} and {v!r}.")
+        if key is not None and key in edge_data:
+            return edge_data[key]["geometry"]
+        return next(iter(edge_data.values()))["geometry"]
     
     def get_buffered_shape(self):
         """Create a merged buffer around all highway geometries.
@@ -329,8 +350,7 @@ class RoadSkeletonizer:
             chain = [u] + nx.shortest_path(subG, source=endpoints[0], target=endpoints[-1]) + [v]
             geoms = []
             for prev, next in zip(chain[:-1], chain[1:]):
-                geom = self.G.get_edge_data(prev, next)[0]['geometry']
-                geoms.append(geom)
+                geoms.append(self._get_edge_geometry(prev, next))
             
             # Robust merge of a chain into a single LineString
             merged_geom = linemerge(unary_union(geoms))
@@ -381,8 +401,7 @@ class RoadSkeletonizer:
                     continue
                 else:
                     u = nbr[0]
-                    edge_data = self.G.get_edge_data(n, u)[0]
-                    length = edge_data['geometry'].length
+                    length = self._get_edge_geometry(n, u).length
                     if length < min_length:
                         self.G.remove_node(n)
                         dangling = True
@@ -414,7 +433,11 @@ class RoadSkeletonizer:
         t3 = time.perf_counter()
         
         # get subgraph of edges smaller than min_length
-        small_edges = [(u, v, 0) for u, v, k in self.G.edges(data=True) if k['geometry'].length < min_length]
+        small_edges = [
+            (u, v, key)
+            for u, v, key, data in self.G.edges(keys=True, data=True)
+            if data['geometry'].length < min_length
+        ]
         subG = self.G.edge_subgraph(small_edges).copy()
         
         # create chains in this subgraph
@@ -477,8 +500,7 @@ class RoadSkeletonizer:
             v = chain[-1]
             geoms = []
             for i in range(len(chain) - 1):
-                edge_data = self.G.get_edge_data(chain[i], chain[i + 1])[0]
-                geoms.append(edge_data['geometry'])
+                geoms.append(self._get_edge_geometry(chain[i], chain[i + 1]))
             
             # Robust merge of a chain into a single LineString
             merged_geom = linemerge(unary_union(geoms))
@@ -520,13 +542,17 @@ class RoadSkeletonizer:
         
         t4 = time.perf_counter()
         ops_short_edges = 0
-        short_edges = [(u, v) for u, v, k in self.G.edges(data=True) if k['geometry'].length < merge_distance]
+        short_edges = [
+            (u, v, key)
+            for u, v, key, data in self.G.edges(keys=True, data=True)
+            if data['geometry'].length < merge_distance
+        ]
         
-        for u, v in short_edges:
+        for u, v, key in short_edges:
             # Skip if nodes were already removed by previous operations
             if u not in self.G.nodes() or v not in self.G.nodes():
                 continue
-            if not self.G.has_edge(u, v):
+            if key not in self.G.get_edge_data(u, v, default={}):
                 continue
             
             if self.verbose:
@@ -534,14 +560,14 @@ class RoadSkeletonizer:
             
             deg_u = self.G.degree(u)
             deg_v = self.G.degree(v)
-            geom_edge = self.G.get_edge_data(u, v, 0)['geometry']
+            geom_edge = self._get_edge_geometry(u, v, key)
             
             # if both degrees are 2, search for shorter attaching edge and merge
             if deg_u == 2 and deg_v == 2:
                 next_node_u = [nbr for nbr in self.G.neighbors(u) if nbr != v][0]
                 next_node_v = [nbr for nbr in self.G.neighbors(v) if nbr != u][0]
-                geom_u = self.G.get_edge_data(u, next_node_u)[0]['geometry']
-                geom_v = self.G.get_edge_data(v, next_node_v)[0]['geometry']
+                geom_u = self._get_edge_geometry(u, next_node_u)
+                geom_v = self._get_edge_geometry(v, next_node_v)
                 if geom_u.length < geom_v.length:
                     segment_new = linemerge(unary_union([geom_edge, geom_u]))
                     if segment_new.geom_type == 'MultiLineString':
@@ -559,7 +585,7 @@ class RoadSkeletonizer:
             # if one degree is 2, merge with edge attaching from that direction
             elif deg_u == 2 and deg_v != 2:
                 next_node_u = [nbr for nbr in self.G.neighbors(u) if nbr != v][0]
-                geom_u = self.G.get_edge_data(u, next_node_u)[0]['geometry']
+                geom_u = self._get_edge_geometry(u, next_node_u)
                 segment_new = linemerge(unary_union([geom_edge, geom_u]))
                 if segment_new.geom_type == 'MultiLineString':
                     segment_new = LineString([pt for line in segment_new.geoms for pt in line.coords])
@@ -568,7 +594,7 @@ class RoadSkeletonizer:
                 ops_short_edges += 1
             elif deg_u != 2 and deg_v == 2:
                 next_node_v = [nbr for nbr in self.G.neighbors(v) if nbr != u][0]
-                geom_v = self.G.get_edge_data(v, next_node_v)[0]['geometry']
+                geom_v = self._get_edge_geometry(v, next_node_v)
                 segment_new = linemerge(unary_union([geom_edge, geom_v]))
                 if segment_new.geom_type == 'MultiLineString':
                     segment_new = LineString([pt for line in segment_new.geoms for pt in line.coords])
@@ -589,7 +615,7 @@ class RoadSkeletonizer:
                 # Redirect all edges from u (except u-v)
                 for nbr in list(self.G.neighbors(u)):
                     if nbr != v:
-                        geom_old = self.G.get_edge_data(u, nbr)[0]['geometry']
+                        geom_old = self._get_edge_geometry(u, nbr)
                         # Adjust geometry to connect to new center
                         coords_old = list(geom_old.coords)
                         if coords_old[0] == (pos_u_x, pos_u_y):
@@ -605,7 +631,7 @@ class RoadSkeletonizer:
                 # Redirect all edges from v (except u-v)
                 for nbr in list(self.G.neighbors(v)):
                     if nbr != u:
-                        geom_old = self.G.get_edge_data(v, nbr)[0]['geometry']
+                        geom_old = self._get_edge_geometry(v, nbr)
                         coords_old = list(geom_old.coords)
                         if coords_old[0] == (pos_v_x, pos_v_y):
                             new_coords = [(center_x, center_y)] + coords_old[1:]
