@@ -71,7 +71,7 @@ After `fit(polygon)`, the instance exposes the intermediate pipeline state:
 - `buffered_shape`: merged buffered geometry in `EPSG:3857`
 - `linestring_skeleton`: generated centerline geometries
 - `G`: simplified undirected NetworkX graph
-- `nodes`, `segments`: graph data created before simplification
+- `nodes`, `segments`: GeoDataFrames matching the final simplified graph
 - `error_message`: message recorded when a fallback OSM or skeleton step is used
 
 Use `get_simplified_skeleton()` for GeoDataFrames reconstructed from the final
