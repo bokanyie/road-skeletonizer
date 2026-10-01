@@ -1,0 +1,14 @@
+# Versions verified with test.ipynb on Python 3.12.
+centerline==1.1.1
+contextily==1.6.2
+folium==0.19.6
+geopandas==1.0.1
+matplotlib==3.10.3
+networkx==3.4.2
+osmnx==2.0.4
+pandas==2.2.3
+pyproj==3.7.1
+shapely==2.1.2
+
+# Running test.ipynb
+ipykernel==6.29.5

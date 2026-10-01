@@ -7,11 +7,22 @@ GeoDataFrames.
 
 ## Requirements
 
-The project currently has no package metadata, so install the runtime
-dependencies directly in the active Python environment:
+The project currently has no package metadata. Create a virtual environment
+and install the pinned dependencies from `requirements.txt` (tested with
+Python 3.12):
 
 ```bash
-pip install centerline contextily folium geopandas matplotlib networkx osmnx pandas pyproj shapely
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+To run `test.ipynb` with this environment, register it as a Jupyter kernel
+and select "road-skeletonizer" in your notebook editor:
+
+```bash
+python -m ipykernel install --user --name road-skeletonizer
 ```
 
 An internet connection is required while `fit()` downloads road features from
